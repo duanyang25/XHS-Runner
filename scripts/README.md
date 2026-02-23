@@ -84,6 +84,20 @@ SSH 配置脚本。
 ### `monitor-performance.sh`
 性能监控脚本。
 
+### `ops/docker-cleanup.sh`
+Docker/日志清理脚本。默认保留运行中容器和数据卷，只清理旧镜像与构建缓存。
+
+```bash
+sudo bash scripts/ops/docker-cleanup.sh --mode deploy
+```
+
+### `ops/install-docker-cleanup-timer.sh`
+安装 systemd 定时清理任务（每日自动执行 `docker-cleanup.sh`）。
+
+```bash
+sudo bash scripts/ops/install-docker-cleanup-timer.sh
+```
+
 ## 脚本开发规范
 
 1. **命名规范**：使用 kebab-case，如 `sync-prompts-to-langfuse.ts`

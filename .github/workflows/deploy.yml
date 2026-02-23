@@ -40,6 +40,25 @@ jobs:
           # Populate known_hosts for strict checking. Try common key types.
           ssh-keyscan -t ed25519,rsa,ecdsa -H ${{ secrets.TAURUS_HOST }} >> ~/.ssh/known_hosts
 
+      - name: Pre-cleanup rescue (when disk is almost full)
+        run: |
+          ssh -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes \
+            ${{ secrets.TAURUS_USER }}@${{ secrets.TAURUS_HOST }} <<'EOF'
+          set -euo pipefail
+          used="$(df -P / | awk 'NR==2 {gsub(/%/,"",$5); print $5}')"
+          if [ "$used" -ge 95 ]; then
+            echo "Disk usage is ${used}% (>=95%), running rescue cleanup..."
+            docker image prune -af || true
+            docker builder prune -af || true
+            docker container prune -f || true
+            docker network prune -f || true
+            journalctl --vacuum-size=200M || true
+          else
+            echo "Disk usage is ${used}%, skip rescue cleanup."
+          fi
+          df -h /
+          EOF
+
       - name: Stream image to Taurus (docker load)
         run: |
           # Stream over SSH to avoid partial/corrupt uploads for large tarballs.
@@ -48,15 +67,20 @@ jobs:
               ${{ secrets.TAURUS_USER }}@${{ secrets.TAURUS_HOST }} \
               'gunzip | docker load'
 
-      - name: Upload compose file
+      - name: Upload compose and cleanup scripts
         run: |
           scp docker-compose.web.prod.yml ${{ secrets.TAURUS_USER }}@${{ secrets.TAURUS_HOST }}:/root/data/xhs-runner/docker-compose.yml
+          scp scripts/ops/docker-cleanup.sh ${{ secrets.TAURUS_USER }}@${{ secrets.TAURUS_HOST }}:/tmp/docker-cleanup.sh
+          scp scripts/ops/install-docker-cleanup-timer.sh ${{ secrets.TAURUS_USER }}@${{ secrets.TAURUS_HOST }}:/tmp/install-docker-cleanup-timer.sh
 
       - name: Deploy (compose up)
         run: |
           ssh ${{ secrets.TAURUS_USER }}@${{ secrets.TAURUS_HOST }} <<'EOF'
           set -euo pipefail
+          bash /tmp/install-docker-cleanup-timer.sh
           cd /root/data/xhs-runner
           docker compose --env-file .env up -d
+          /usr/local/bin/xhs-docker-cleanup --mode deploy --image-keep-hours 240 --builder-keep-hours 168 --container-keep-hours 168 --journal-keep 7d
           docker compose --env-file .env ps
+          rm -f /tmp/docker-cleanup.sh /tmp/install-docker-cleanup-timer.sh
           EOF
