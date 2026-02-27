@@ -36,3 +36,6 @@ temp_images/
 # Playwright artifacts
 /test-results/
 /playwright-report/
+
+# Local script artifacts
+.xhs-data/

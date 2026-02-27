@@ -46,6 +46,37 @@ npx tsx scripts/init-minio-storage.ts
 
 ## 开发工具
 
+## Auth for test scripts
+
+test-agent-api.ts can call protected APIs by sending the app auth session cookie.
+
+If you do not have an app user yet, bootstrap one locally (credentials via env vars; do NOT commit them):
+
+```bash
+APP_USER_EMAIL="<your-email>" APP_USER_PASSWORD="<your-password>" \
+  npx tsx scripts/bootstrap-app-user.ts
+```
+
+
+Priority order:
+- --cookie (raw Cookie header value)
+- --cookieFile (default: .xhs-data/auth/session.cookie)
+- --loginEmail/--loginPassword (login via /api/app-auth/login, then save cookie)
+
+Copy-paste (do NOT commit credentials):
+
+```bash
+# Start Next.js on a non-default port
+PORT=3001 npm run dev
+
+# Run test script with login and auto cookie persistence
+npx tsx scripts/test-agent-api.ts \
+  --baseUrl http://localhost:3001 \
+  --loginEmail "<your-email>" \
+  --loginPassword "<your-password>" \
+  --auto
+```
+
 ### `replay-agent-run.ts`
 回放本地 `writeRunArtifacts` 生成的 agent run（`.xhs-data/agent-runs/<runId>`），用于复现/调试 SSE 流。
 
