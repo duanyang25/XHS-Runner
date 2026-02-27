@@ -8,7 +8,7 @@ import { join } from 'node:path';
 
 const API_BASE = process.env.AGENT_API_BASE || 'http://localhost:3000';
 const DEFAULT_MESSAGE = 'Vibecoding 上手教程：面向新手，3步+3坑，80~120字，口语化，小红书风格，包含 #标签。';
-const DEFAULT_OUT_DIR = '.xhs-data/test-outputs';
+const DEFAULT_OUT_DIR = '.xhs-data/agent-runs';
 
 type Mode = 'fast' | 'normal';
 
@@ -51,6 +51,7 @@ interface TestOptions {
 
 interface RunSummary {
   mode: Mode;
+  themeId: number;
   complete: boolean;
   hasImages: boolean;
   totalMs: number;
@@ -61,6 +62,7 @@ interface RunSummary {
   tagCount?: number;
   imageAssetIds: number[];
   imagePaths: string[];
+  outJsonPath?: string;
 }
 
 function formatMs(ms: number): string {
@@ -148,7 +150,7 @@ function summarizeQuality(event?: StreamEvent | null): string | undefined {
   return `overall:${overall}${dims ? ` | ${dims}` : ''}`;
 }
 
-function buildSummary(mode: Mode, events: StreamEvent[], startedAt: number): RunSummary {
+function buildSummary(mode: Mode, themeId: number, events: StreamEvent[], startedAt: number): RunSummary {
   const agentStarts = new Map<string, number>();
   const agentDurations = new Map<string, number>();
   const firstEventTs = events.find((event) => typeof event.timestamp === 'number')?.timestamp;
@@ -191,6 +193,7 @@ function buildSummary(mode: Mode, events: StreamEvent[], startedAt: number): Run
 
   return {
     mode,
+    themeId,
     complete,
     hasImages,
     totalMs: Math.max(0, endTs - baseStart),
@@ -375,7 +378,12 @@ async function continueWithDefault(threadId: string, { showAll = false, compact 
 
 async function runOnce(mode: Mode, options: TestOptions): Promise<RunSummary> {
   const startedAt = Date.now();
-  const { autoConfirm = false, renderImages: shouldRenderImages = false, outDir = DEFAULT_OUT_DIR } = options;
+  const {
+    autoConfirm = false,
+    renderImages: shouldRenderImages = false,
+    outDir = DEFAULT_OUT_DIR,
+    themeId = 1,
+  } = options;
 
   const { threadId, events } = await submitTask({
     ...options,
@@ -398,7 +406,37 @@ async function runOnce(mode: Mode, options: TestOptions): Promise<RunSummary> {
     activeThread = result.threadId;
   }
 
-  const summary = buildSummary(mode, allEvents, startedAt);
+  const summary = buildSummary(mode, themeId, allEvents, startedAt);
+
+  // Always persist the raw events so we can diff/debug without re-running.
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  await mkdir(outDir, { recursive: true });
+  const outJsonPath = join(outDir, `${stamp}-${mode}-theme${themeId}.json`);
+  await writeFile(
+    outJsonPath,
+    JSON.stringify(
+      {
+        meta: {
+          apiBase: API_BASE,
+          mode,
+          themeId,
+          message: options.message,
+          fastMode: mode === 'fast',
+          enableHITL: options.enableHITL,
+          imageGenProvider: options.imageGenProvider,
+          threadId,
+          startedAt,
+        },
+        summary,
+        events: allEvents,
+      },
+      null,
+      2
+    ),
+    'utf8'
+  );
+  summary.outJsonPath = outJsonPath;
+
   if (shouldRenderImages && summary.imageAssetIds.length > 0) {
     summary.imagePaths = await renderImagesToDisk(summary.imageAssetIds, outDir, mode);
   }
@@ -411,10 +449,13 @@ function printSummary(summary: RunSummary) {
     .map((item) => `${item.agent}:${formatMs(item.ms)}`)
     .join(' | ');
 
-  console.log(`\n=== ${summary.mode.toUpperCase()} 总结 ===`);
+  console.log(`\n=== ${summary.mode.toUpperCase()} 总结 (themeId=${summary.themeId}) ===`);
   console.log(`完成: ${summary.complete ? '是' : '否'} | 图片: ${summary.hasImages ? '有' : '无'}`);
   console.log(`总耗时: ${formatMs(summary.totalMs)}${slowest ? ` | 最慢: ${slowest}` : ''}`);
   console.log(`质量: ${summary.quality || 'n/a'}`);
+  if (summary.outJsonPath) {
+    console.log(`事件JSON: ${summary.outJsonPath}`);
+  }
   if (summary.title) {
     console.log(`标题: ${summary.title}`);
   }
@@ -445,7 +486,7 @@ function parseArgs(argv: string[]) {
   const flags = new Set<string>();
   const values: Record<string, string> = {};
   const positionals: string[] = [];
-  const valueFlags = new Set(['--continue', '--out', '--theme', '--provider', '--message']);
+  const valueFlags = new Set(['--continue', '--out', '--theme', '--themes', '--provider', '--message']);
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -482,6 +523,13 @@ async function main() {
   const mode: Mode = flags.has('--normal') ? 'normal' : 'fast';
   const message = values['--message'] || positionals[0] || DEFAULT_MESSAGE;
   const themeId = values['--theme'] ? Number(values['--theme']) : 1;
+  const themeIds = (values['--themes'] || '')
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .map((entry) => Number(entry))
+    .filter((id) => Number.isFinite(id) && id > 0);
+
   const imageGenProvider = values['--provider'] || 'jimeng';
   const autoConfirm = flags.has('--auto') || runBoth;
   const enableHITL = !flags.has('--no-hitl');
@@ -490,9 +538,8 @@ async function main() {
   const renderImages = flags.has('--render');
   const outDir = values['--out'] || DEFAULT_OUT_DIR;
 
-  const baseOptions: TestOptions = {
+  const baseOptions: Omit<TestOptions, 'themeId'> = {
     message,
-    themeId,
     enableHITL,
     imageGenProvider,
     autoConfirm,
@@ -502,18 +549,25 @@ async function main() {
     outDir,
   };
 
+  const targets = themeIds.length > 0 ? themeIds : [themeId];
   const results: RunSummary[] = [];
 
-  if (runBoth) {
-    results.push(await runOnce('fast', baseOptions));
-    results.push(await runOnce('normal', baseOptions));
-    results.forEach(printSummary);
-    printSuiteSummary(results);
-    return;
+  for (const id of targets) {
+    const options: TestOptions = { ...baseOptions, themeId: id };
+
+    if (runBoth) {
+      results.push(await runOnce('fast', options));
+      results.push(await runOnce('normal', options));
+      continue;
+    }
+
+    results.push(await runOnce(mode, { ...options, fastMode: mode === 'fast' }));
   }
 
-  const summary = await runOnce(mode, { ...baseOptions, fastMode: mode === 'fast' });
-  printSummary(summary);
+  results.forEach(printSummary);
+  if (results.length > 1) {
+    printSuiteSummary(results);
+  }
 }
 
 main().catch((error) => {
