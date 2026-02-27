@@ -62,6 +62,7 @@ interface TestOptions {
   compact?: boolean;
   renderImages?: boolean;
   outDir?: string;
+  allowEmptyImages?: boolean;
   auth?: AuthOptions;
 }
 
@@ -314,7 +315,13 @@ async function resolveCookie(baseUrl: string, auth?: AuthOptions): Promise<strin
   return undefined;
 }
 
-async function renderImagesToDisk(baseUrl: string, assetIds: number[], outDir: string, mode: Mode): Promise<string[]> {
+async function renderImagesToDisk(
+  baseUrl: string,
+  assetIds: number[],
+  outDir: string,
+  mode: Mode,
+  authCookie?: string
+): Promise<string[]> {
   if (assetIds.length === 0) return [];
 
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -324,17 +331,31 @@ async function renderImagesToDisk(baseUrl: string, assetIds: number[], outDir: s
   const saved: string[] = [];
   for (let i = 0; i < assetIds.length; i += 1) {
     const assetId = assetIds[i];
-    const response = await fetch(`${baseUrl}/api/assets/${assetId}`);
+    const response = await fetch(`${baseUrl}/api/assets/${assetId}`, {
+      headers: authCookie ? { Cookie: authCookie } : undefined,
+      redirect: 'manual',
+    });
+    if (response.status === 307 || response.status === 302) {
+      console.warn(`⚠️  获取图片被重定向(可能未登录): ${assetId} (${response.status})`);
+      continue;
+    }
     if (!response.ok) {
       console.warn(`⚠️  获取图片失败: ${assetId} (${response.status})`);
       continue;
     }
-    const contentType = response.headers.get('content-type') || '';
+
+    const contentType = (response.headers.get('content-type') || '').toLowerCase();
+    if (contentType.includes('text/html')) {
+      console.warn(`⚠️  获取图片返回HTML(可能未登录): ${assetId}`);
+      continue;
+    }
+
     const ext = contentType.includes('png')
       ? 'png'
       : contentType.includes('jpeg') || contentType.includes('jpg')
         ? 'jpg'
         : 'bin';
+
     const buffer = Buffer.from(await response.arrayBuffer());
     const filePath = join(runDir, `image-${i + 1}.${ext}`);
     await writeFile(filePath, buffer);
@@ -533,6 +554,13 @@ async function runOnce(mode: Mode, options: TestOptions, cookie?: string): Promi
 
   const summary = buildSummary(mode, themeId, allEvents, startedAt);
 
+  if (summary.complete && summary.imageAssetIds.length === 0 && !options.allowEmptyImages) {
+    throw new Error(
+      `No images were generated (imageAssetIds=[]). This is a regression for the agent pipeline. ` +
+      `Re-run with --allow-empty-images to bypass.`
+    );
+  }
+
   // Always persist the raw events so we can diff/debug without re-running.
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   await mkdir(outDir, { recursive: true });
@@ -564,7 +592,7 @@ async function runOnce(mode: Mode, options: TestOptions, cookie?: string): Promi
   summary.outJsonPath = outJsonPath;
 
   if (shouldRenderImages && summary.imageAssetIds.length > 0) {
-    summary.imagePaths = await renderImagesToDisk(options.baseUrl, summary.imageAssetIds, outDir, mode);
+    summary.imagePaths = await renderImagesToDisk(options.baseUrl, summary.imageAssetIds, outDir, mode, cookie);
   }
 
   return summary;
@@ -687,6 +715,7 @@ async function main() {
   const compact = flags.has('--compact');
   const showAll = flags.has('--verbose');
   const renderImages = flags.has('--render');
+  const allowEmptyImages = flags.has('--allow-empty-images');
   const outDir = values['--out'] || DEFAULT_OUT_DIR;
 
   const baseOptions: Omit<TestOptions, 'themeId'> = {
@@ -699,6 +728,7 @@ async function main() {
     compact,
     renderImages,
     outDir,
+    allowEmptyImages,
     auth,
   };
 
