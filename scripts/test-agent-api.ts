@@ -1,16 +1,23 @@
 /**
  * Agent API 测试脚本
  * 用于快速测试 fastMode 和普通模式，支持自动续跑与指标统计。
+ *
+ * Auth:
+ * - Supports cookie injection for protected APIs.
+ * - Can login via /api/app-auth/login and persist session cookie.
  */
 
-import { mkdir, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
 
-const API_BASE = process.env.AGENT_API_BASE || 'http://localhost:3000';
+const DEFAULT_BASE_URL = 'http://localhost:3000';
 const DEFAULT_MESSAGE = 'Vibecoding 上手教程：面向新手，3步+3坑，80~120字，口语化，小红书风格，包含 #标签。';
 const DEFAULT_OUT_DIR = '.xhs-data/agent-runs';
+const DEFAULT_COOKIE_FILE = '.xhs-data/auth/session.cookie';
 
 type Mode = 'fast' | 'normal';
+
+type HeadersLike = Record<string, string>;
 
 interface AskUserOption {
   id: string;
@@ -36,7 +43,15 @@ interface StreamEvent {
   tags?: string[];
 }
 
+interface AuthOptions {
+  cookie?: string;
+  cookieFile?: string;
+  loginEmail?: string;
+  loginPassword?: string;
+}
+
 interface TestOptions {
+  baseUrl: string;
   message: string;
   themeId?: number;
   fastMode?: boolean;
@@ -47,6 +62,7 @@ interface TestOptions {
   compact?: boolean;
   renderImages?: boolean;
   outDir?: string;
+  auth?: AuthOptions;
 }
 
 interface RunSummary {
@@ -207,7 +223,98 @@ function buildSummary(mode: Mode, themeId: number, events: StreamEvent[], starte
   };
 }
 
-async function renderImagesToDisk(assetIds: number[], outDir: string, mode: Mode): Promise<string[]> {
+function normalizeCookie(raw: string): string {
+  return raw.trim().replace(/^Cookie:\s*/i, '');
+}
+
+function parseSetCookieToCookieHeader(setCookie: string | null): string | null {
+  if (!setCookie) return null;
+  // Node fetch may join multiple Set-Cookie headers with comma; we only need name=value.
+  // If there are multiple cookies, best-effort parse by splitting on comma that starts a new cookie.
+  const parts = setCookie
+    .split(/,(?=[^;]+?=)/g)
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .map((entry) => entry.split(';')[0]?.trim())
+    .filter(Boolean);
+  if (parts.length === 0) return null;
+  return parts.join('; ');
+}
+
+async function loadCookieFromFile(filePath: string): Promise<string | null> {
+  try {
+    const content = await readFile(filePath, 'utf8');
+    const raw = content.trim();
+    return raw ? normalizeCookie(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function saveCookieToFile(filePath: string, cookie: string) {
+  await mkdir(dirname(filePath), { recursive: true });
+  await writeFile(filePath, normalizeCookie(cookie) + '\n', 'utf8');
+}
+
+function buildHeaders(cookie?: string): HeadersLike {
+  const headers: HeadersLike = { 'Content-Type': 'application/json' };
+  if (cookie) headers.Cookie = normalizeCookie(cookie);
+  return headers;
+}
+
+function isRedirectToLogin(response: Response): boolean {
+  if (response.status !== 307) return false;
+  const location = response.headers.get('location') || '';
+  return location.includes('/login');
+}
+
+async function ensureAuthenticated(response: Response) {
+  if (!isRedirectToLogin(response)) return;
+  throw new Error('Not authenticated. Provide --cookie or --loginEmail/--loginPassword');
+}
+
+async function loginAndGetCookie(baseUrl: string, email: string, password: string): Promise<string> {
+  const response = await fetch(`${baseUrl}/api/app-auth/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email, password }),
+    redirect: 'manual',
+  });
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => '');
+    throw new Error(`Login failed: HTTP ${response.status} ${response.statusText}${text ? ` | ${text}` : ''}`);
+  }
+
+  const setCookie = response.headers.get('set-cookie');
+  const cookie = parseSetCookieToCookieHeader(setCookie);
+  if (!cookie) {
+    throw new Error('Login succeeded but no Set-Cookie received');
+  }
+
+  return cookie;
+}
+
+async function resolveCookie(baseUrl: string, auth?: AuthOptions): Promise<string | undefined> {
+  if (!auth) return undefined;
+
+  if (auth.cookie) return normalizeCookie(auth.cookie);
+
+  const cookieFile = auth.cookieFile || DEFAULT_COOKIE_FILE;
+  const fileCookie = await loadCookieFromFile(cookieFile);
+  if (fileCookie) return fileCookie;
+
+  if (auth.loginEmail && auth.loginPassword) {
+    const cookie = await loginAndGetCookie(baseUrl, auth.loginEmail, auth.loginPassword);
+    await saveCookieToFile(cookieFile, cookie);
+    console.log(`[auth] Logged in, cookie saved to ${cookieFile}`);
+    return cookie;
+  }
+
+  return undefined;
+}
+
+async function renderImagesToDisk(baseUrl: string, assetIds: number[], outDir: string, mode: Mode): Promise<string[]> {
   if (assetIds.length === 0) return [];
 
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -217,7 +324,7 @@ async function renderImagesToDisk(assetIds: number[], outDir: string, mode: Mode
   const saved: string[] = [];
   for (let i = 0; i < assetIds.length; i += 1) {
     const assetId = assetIds[i];
-    const response = await fetch(`${API_BASE}/api/assets/${assetId}`);
+    const response = await fetch(`${baseUrl}/api/assets/${assetId}`);
     if (!response.ok) {
       console.warn(`⚠️  获取图片失败: ${assetId} (${response.status})`);
       continue;
@@ -290,8 +397,9 @@ function printEvent(event: StreamEvent, { showAll = false, compact = false } = {
   }
 }
 
-async function submitTask(options: TestOptions): Promise<{ threadId: string | null; events: StreamEvent[] }> {
+async function submitTask(options: TestOptions, cookie?: string): Promise<{ threadId: string | null; events: StreamEvent[] }> {
   const {
+    baseUrl,
     message,
     themeId = 1,
     fastMode = false,
@@ -302,11 +410,12 @@ async function submitTask(options: TestOptions): Promise<{ threadId: string | nu
   } = options;
 
   console.log(`\n📝 提交任务: ${message}`);
-  console.log(`   fastMode: ${fastMode}, HITL: ${enableHITL}\n`);
+  console.log(`   baseUrl: ${baseUrl}`);
+  console.log(`   fastMode: ${fastMode}, HITL: ${enableHITL}` + (cookie ? ', auth: cookie' : ', auth: none') + '\n');
 
-  const response = await fetch(`${API_BASE}/api/agent/stream`, {
+  const response = await fetch(`${baseUrl}/api/agent/stream`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: buildHeaders(cookie),
     body: JSON.stringify({
       message,
       themeId,
@@ -314,7 +423,10 @@ async function submitTask(options: TestOptions): Promise<{ threadId: string | nu
       enableHITL,
       imageGenProvider,
     }),
+    redirect: 'manual',
   });
+
+  await ensureAuthenticated(response);
 
   if (!response.ok) {
     throw new Error(`HTTP ${response.status}: ${response.statusText}`);
@@ -331,17 +443,22 @@ async function submitTask(options: TestOptions): Promise<{ threadId: string | nu
 }
 
 async function continueTask(
+  options: Pick<TestOptions, 'baseUrl'>,
+  cookie: string | undefined,
   threadId: string,
   askUserEvent: StreamEvent | null,
   { showAll = false, compact = false } = {}
 ): Promise<{ threadId: string | null; events: StreamEvent[] }> {
   const payload = buildConfirmPayload(threadId, askUserEvent || undefined);
 
-  const response = await fetch(`${API_BASE}/api/agent/confirm`, {
+  const response = await fetch(`${options.baseUrl}/api/agent/confirm`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: buildHeaders(cookie),
     body: JSON.stringify(payload),
+    redirect: 'manual',
   });
+
+  await ensureAuthenticated(response);
 
   if (!response.ok) {
     throw new Error(`HTTP ${response.status}: ${response.statusText}`);
@@ -356,15 +473,23 @@ async function continueTask(
   return { threadId: paused ? threadId : null, events };
 }
 
-async function continueWithDefault(threadId: string, { showAll = false, compact = false } = {}) {
-  const response = await fetch(`${API_BASE}/api/agent/confirm`, {
+async function continueWithDefault(
+  options: Pick<TestOptions, 'baseUrl'>,
+  cookie: string | undefined,
+  threadId: string,
+  { showAll = false, compact = false } = {}
+) {
+  const response = await fetch(`${options.baseUrl}/api/agent/confirm`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: buildHeaders(cookie),
     body: JSON.stringify({
       threadId,
       userResponse: { selectedIds: ['continue_default'] },
     }),
+    redirect: 'manual',
   });
+
+  await ensureAuthenticated(response);
 
   if (!response.ok) {
     throw new Error(`HTTP ${response.status}: ${response.statusText}`);
@@ -376,7 +501,7 @@ async function continueWithDefault(threadId: string, { showAll = false, compact 
   }
 }
 
-async function runOnce(mode: Mode, options: TestOptions): Promise<RunSummary> {
+async function runOnce(mode: Mode, options: TestOptions, cookie?: string): Promise<RunSummary> {
   const startedAt = Date.now();
   const {
     autoConfirm = false,
@@ -388,7 +513,7 @@ async function runOnce(mode: Mode, options: TestOptions): Promise<RunSummary> {
   const { threadId, events } = await submitTask({
     ...options,
     fastMode: mode === 'fast',
-  });
+  }, cookie);
 
   let activeThread = threadId;
   let allEvents = [...events];
@@ -397,7 +522,7 @@ async function runOnce(mode: Mode, options: TestOptions): Promise<RunSummary> {
   while (activeThread && autoConfirm) {
     console.log(`\n⏭️  自动继续 (threadId: ${activeThread})...`);
     await new Promise((resolve) => setTimeout(resolve, 500));
-    const result = await continueTask(activeThread, lastAskUser, {
+    const result = await continueTask({ baseUrl: options.baseUrl }, cookie, activeThread, lastAskUser, {
       showAll: options.showAll,
       compact: options.compact,
     });
@@ -417,7 +542,7 @@ async function runOnce(mode: Mode, options: TestOptions): Promise<RunSummary> {
     JSON.stringify(
       {
         meta: {
-          apiBase: API_BASE,
+          baseUrl: options.baseUrl,
           mode,
           themeId,
           message: options.message,
@@ -426,6 +551,7 @@ async function runOnce(mode: Mode, options: TestOptions): Promise<RunSummary> {
           imageGenProvider: options.imageGenProvider,
           threadId,
           startedAt,
+          authed: Boolean(cookie),
         },
         summary,
         events: allEvents,
@@ -438,7 +564,7 @@ async function runOnce(mode: Mode, options: TestOptions): Promise<RunSummary> {
   summary.outJsonPath = outJsonPath;
 
   if (shouldRenderImages && summary.imageAssetIds.length > 0) {
-    summary.imagePaths = await renderImagesToDisk(summary.imageAssetIds, outDir, mode);
+    summary.imagePaths = await renderImagesToDisk(options.baseUrl, summary.imageAssetIds, outDir, mode);
   }
 
   return summary;
@@ -486,7 +612,19 @@ function parseArgs(argv: string[]) {
   const flags = new Set<string>();
   const values: Record<string, string> = {};
   const positionals: string[] = [];
-  const valueFlags = new Set(['--continue', '--out', '--theme', '--themes', '--provider', '--message']);
+  const valueFlags = new Set([
+    '--continue',
+    '--out',
+    '--theme',
+    '--themes',
+    '--provider',
+    '--message',
+    '--baseUrl',
+    '--loginEmail',
+    '--loginPassword',
+    '--cookie',
+    '--cookieFile',
+  ]);
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -509,13 +647,26 @@ async function main() {
   const args = process.argv.slice(2);
   const { flags, values, positionals } = parseArgs(args);
 
+  const baseUrl = values['--baseUrl'] || process.env.AGENT_API_BASE || DEFAULT_BASE_URL;
+
+  const auth: AuthOptions = {
+    cookie: values['--cookie'],
+    cookieFile: values['--cookieFile'] || DEFAULT_COOKIE_FILE,
+    loginEmail: values['--loginEmail'],
+    loginPassword: values['--loginPassword'],
+  };
+  const cookie = await resolveCookie(baseUrl, auth);
+
   if (flags.has('--continue')) {
     const threadId = values['--continue'] || positionals[0];
     if (!threadId) {
       console.error('Usage: npx tsx scripts/test-agent-api.ts --continue <threadId>');
       process.exit(1);
     }
-    await continueWithDefault(threadId, { showAll: flags.has('--verbose'), compact: flags.has('--compact') });
+    await continueWithDefault({ baseUrl }, cookie, threadId, {
+      showAll: flags.has('--verbose'),
+      compact: flags.has('--compact'),
+    });
     return;
   }
 
@@ -539,6 +690,7 @@ async function main() {
   const outDir = values['--out'] || DEFAULT_OUT_DIR;
 
   const baseOptions: Omit<TestOptions, 'themeId'> = {
+    baseUrl,
     message,
     enableHITL,
     imageGenProvider,
@@ -547,6 +699,7 @@ async function main() {
     compact,
     renderImages,
     outDir,
+    auth,
   };
 
   const targets = themeIds.length > 0 ? themeIds : [themeId];
@@ -556,12 +709,12 @@ async function main() {
     const options: TestOptions = { ...baseOptions, themeId: id };
 
     if (runBoth) {
-      results.push(await runOnce('fast', options));
-      results.push(await runOnce('normal', options));
+      results.push(await runOnce('fast', options, cookie));
+      results.push(await runOnce('normal', options, cookie));
       continue;
     }
 
-    results.push(await runOnce(mode, { ...options, fastMode: mode === 'fast' }));
+    results.push(await runOnce(mode, { ...options, fastMode: mode === 'fast' }, cookie));
   }
 
   results.forEach(printSummary);
